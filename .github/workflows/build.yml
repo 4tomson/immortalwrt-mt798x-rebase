@@ -100,6 +100,9 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # ============================================================
+      # Проверка/инжект профиля NX32U
+      # ============================================================
       - name: Inject NX32U Profile
         run: |
           cd openwrt
@@ -107,25 +110,32 @@ jobs:
           DTS_DIR="target/linux/mediatek/dts"
           DTS_FILE="$DTS_DIR/mt7981b-netis-nx32u.dts"
 
-          echo "=== check for netis_nx32u ==="
+          echo "=== check for netis_nx32u profile ==="
           if grep -q "Device/netis_nx32u" "$FILOGIC"; then
-            echo "OK: profile already present"
+            echo "OK: netis_nx32u profile already present"
+            awk '/^define Device\/netis_nx32u$/,/^TARGET_DEVICES/' "$FILOGIC"
             exit 0
           fi
 
+          echo "WARN: netis_nx32u profile missing, injecting"
+
           echo "=== download DTS ==="
           mkdir -p "$DTS_DIR"
+          DTS_OK=0
           for url in \
             "https://raw.githubusercontent.com/openwrt/openwrt/main/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts" \
-            "https://raw.githubusercontent.com/openwrt/openwrt/master/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts"; do
+            "https://raw.githubusercontent.com/openwrt/openwrt/master/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts" \
+            "https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts"; do
+            echo "try: $url"
             if curl -fsSL -o "$DTS_FILE" "$url" && [ -s "$DTS_FILE" ]; then
               echo "OK: DTS downloaded ($(wc -l < $DTS_FILE) lines)"
+              DTS_OK=1
               break
             fi
           done
 
-          if [ ! -s "$DTS_FILE" ]; then
-            echo "ERROR: failed to download DTS"
+          if [ "$DTS_OK" != "1" ]; then
+            echo "ERROR: failed to download DTS from all sources"
             exit 1
           fi
 
@@ -161,6 +171,54 @@ EOF
           echo "=== verify ==="
           awk '/^define Device\/netis_nx32u$/,/^TARGET_DEVICES/' "$FILOGIC"
 
+      # ============================================================
+      # Проверка U-Boot для NX32U
+      # ============================================================
+      - name: Verify U-Boot for NX32U
+        run: |
+          cd openwrt
+          UBOOT_MK="package/boot/uboot-mediatek/Makefile"
+
+          echo "=== check U-Boot/mt7981_netis_nx32u ==="
+          if grep -q "U-Boot/mt7981_netis_nx32u" "$UBOOT_MK"; then
+            echo "OK: U-Boot/mt7981_netis_nx32u present"
+          else
+            echo "ERROR: U-Boot/mt7981_netis_nx32u MISSING in quytttb"
+            echo "=== existing netis entries ==="
+            grep -n "netis" "$UBOOT_MK" || echo "нет netis вообще"
+            echo ""
+            echo "=== существующие U-Boot mt7981_* ==="
+            grep -n "^define U-Boot/mt7981_" "$UBOOT_MK" || echo "нет mt7981 вообще"
+            echo ""
+            echo "УБЕДИСЬ что в этом файле есть U-Boot/mt7981_netis_nx32u, иначе будет ошибка"
+            # не падаем, продолжаем — проверим реально на этапе сборки
+          fi
+
+      # ============================================================
+      # Патч mtwifi-cfg-ucode — убираем зависимость iwinfo-ucode
+      # ============================================================
+      - name: Patch mtwifi-cfg-ucode (remove iwinfo-ucode dep)
+        run: |
+          cd openwrt
+          MK="package/mtk/applications/mtwifi-cfg-ucode/Makefile"
+          if [ ! -f "$MK" ]; then
+            echo "WARN: $MK not found, skipping"
+            exit 0
+          fi
+
+          echo "=== BEFORE ==="
+          grep "DEPENDS" "$MK" | head -3
+
+          # убираем +iwinfo-ucode из DEPENDS
+          sed -i 's/+iwinfo-ucode//g' "$MK"
+
+          echo "=== AFTER ==="
+          grep "DEPENDS" "$MK" | head -3
+          echo "OK: патч применён"
+
+      # ============================================================
+      # Патч libgcc для APK
+      # ============================================================
       - name: Fix libgcc Version for APK
         run: |
           cd openwrt
