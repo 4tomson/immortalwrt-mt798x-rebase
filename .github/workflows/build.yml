@@ -52,10 +52,7 @@ jobs:
       - name: Install Dependencies
         run: |
           MISSING=""
-          for pkg in build-essential clang flex bison g++ gawk gcc-multilib \
-                     g++-multilib gettext git libncurses-dev libssl-dev \
-                     python3-setuptools python3-dev swig rsync unzip \
-                     zlib1g-dev file wget ccache; do
+          for pkg in build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3-setuptools python3-dev swig rsync unzip zlib1g-dev file wget ccache; do
             dpkg -s "$pkg" >/dev/null 2>&1 || MISSING="$MISSING $pkg"
           done
           if [ -n "$MISSING" ]; then
@@ -100,103 +97,33 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # ============================================================
-      # Проверка/инжект профиля NX32U
-      # ============================================================
-      - name: Inject NX32U Profile
+      - name: Check NX32U Profile
         run: |
           cd openwrt
           FILOGIC="target/linux/mediatek/image/filogic.mk"
-          DTS_DIR="target/linux/mediatek/dts"
-          DTS_FILE="$DTS_DIR/mt7981b-netis-nx32u.dts"
-
-          echo "=== check for netis_nx32u profile ==="
+          echo "=== NX32U in filogic.mk ==="
           if grep -q "Device/netis_nx32u" "$FILOGIC"; then
-            echo "OK: netis_nx32u profile already present"
+            echo "OK: profile present"
             awk '/^define Device\/netis_nx32u$/,/^TARGET_DEVICES/' "$FILOGIC"
-            exit 0
+          else
+            echo "MISSING: netis_nx32u profile not found in quytttb"
+            echo "=== available netis profiles ==="
+            grep -n "Device/netis" "$FILOGIC" || echo "no netis at all"
           fi
 
-          echo "WARN: netis_nx32u profile missing, injecting"
-
-          echo "=== download DTS ==="
-          mkdir -p "$DTS_DIR"
-          DTS_OK=0
-          for url in \
-            "https://raw.githubusercontent.com/openwrt/openwrt/main/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts" \
-            "https://raw.githubusercontent.com/openwrt/openwrt/master/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts" \
-            "https://raw.githubusercontent.com/openwrt/openwrt/openwrt-24.10/target/linux/mediatek/dts/mt7981b-netis-nx32u.dts"; do
-            echo "try: $url"
-            if curl -fsSL -o "$DTS_FILE" "$url" && [ -s "$DTS_FILE" ]; then
-              echo "OK: DTS downloaded ($(wc -l < $DTS_FILE) lines)"
-              DTS_OK=1
-              break
-            fi
-          done
-
-          if [ "$DTS_OK" != "1" ]; then
-            echo "ERROR: failed to download DTS from all sources"
-            exit 1
-          fi
-
-          echo "=== append profile ==="
-          cat >> "$FILOGIC" << 'EOF'
-
-define Device/netis_nx32u
-  DEVICE_VENDOR := netis
-  DEVICE_MODEL := NX32U
-  DEVICE_DTS := mt7981b-netis-nx32u
-  DEVICE_DTS_DIR := ../dts
-  UBINIZE_OPTS := -E 5
-  BLOCKSIZE := 128k
-  PAGESIZE := 2048
-  KERNEL_IN_UBI := 1
-  UBOOTENV_IN_UBI := 1
-  IMAGES := sysupgrade.itb
-  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
-  KERNEL := kernel-bin | gzip
-  KERNEL_INITRAMFS := kernel-bin | lzma | \
-        fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
-  IMAGE/sysupgrade.itb := append-kernel | \
-        fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
-        append-metadata
-  DEVICE_PACKAGES := kmod-mt_wifi kmod-usb3 kmod-usb-ledtrig-usbport automount
-  ARTIFACTS := preloader.bin bl31-uboot.fip
-  ARTIFACT/preloader.bin := mt7981-bl2 spim-nand-ddr3
-  ARTIFACT/bl31-uboot.fip := mt7981-bl31-uboot netis_nx32u
-endef
-TARGET_DEVICES += netis_nx32u
-EOF
-
-          echo "=== verify ==="
-          awk '/^define Device\/netis_nx32u$/,/^TARGET_DEVICES/' "$FILOGIC"
-
-      # ============================================================
-      # Проверка U-Boot для NX32U
-      # ============================================================
-      - name: Verify U-Boot for NX32U
+      - name: Check U-Boot for NX32U
         run: |
           cd openwrt
           UBOOT_MK="package/boot/uboot-mediatek/Makefile"
-
-          echo "=== check U-Boot/mt7981_netis_nx32u ==="
+          echo "=== U-Boot/mt7981_netis_nx32u ==="
           if grep -q "U-Boot/mt7981_netis_nx32u" "$UBOOT_MK"; then
             echo "OK: U-Boot/mt7981_netis_nx32u present"
           else
-            echo "ERROR: U-Boot/mt7981_netis_nx32u MISSING in quytttb"
-            echo "=== existing netis entries ==="
-            grep -n "netis" "$UBOOT_MK" || echo "нет netis вообще"
-            echo ""
-            echo "=== существующие U-Boot mt7981_* ==="
-            grep -n "^define U-Boot/mt7981_" "$UBOOT_MK" || echo "нет mt7981 вообще"
-            echo ""
-            echo "УБЕДИСЬ что в этом файле есть U-Boot/mt7981_netis_nx32u, иначе будет ошибка"
-            # не падаем, продолжаем — проверим реально на этапе сборки
+            echo "MISSING: U-Boot/mt7981_netis_nx32u not in quytttb"
+            echo "=== existing mt7981 U-Boot entries ==="
+            grep -n "^define U-Boot/mt7981" "$UBOOT_MK" || echo "no mt7981 U-Boot"
           fi
 
-      # ============================================================
-      # Патч mtwifi-cfg-ucode — убираем зависимость iwinfo-ucode
-      # ============================================================
       - name: Patch mtwifi-cfg-ucode (remove iwinfo-ucode dep)
         run: |
           cd openwrt
@@ -205,20 +132,12 @@ EOF
             echo "WARN: $MK not found, skipping"
             exit 0
           fi
-
           echo "=== BEFORE ==="
           grep "DEPENDS" "$MK" | head -3
-
-          # убираем +iwinfo-ucode из DEPENDS
           sed -i 's/+iwinfo-ucode//g' "$MK"
-
           echo "=== AFTER ==="
           grep "DEPENDS" "$MK" | head -3
-          echo "OK: патч применён"
 
-      # ============================================================
-      # Патч libgcc для APK
-      # ============================================================
       - name: Fix libgcc Version for APK
         run: |
           cd openwrt
@@ -273,9 +192,7 @@ EOF
           make defconfig
 
           echo "=== check critical packages ==="
-          for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat \
-                     wifi-dats mtwifi-cfg mtwifi-cfg-ucode luci-app-mtwifi-cfg \
-                     kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
+          for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
             grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
           done
 
