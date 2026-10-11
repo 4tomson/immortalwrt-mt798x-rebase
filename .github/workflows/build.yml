@@ -68,12 +68,10 @@ jobs:
           DL_CACHE="$RUNNER_WORKSPACE/dl-cache"
           mkdir -p "$DL_CACHE"
           echo "DL_CACHE=$DL_CACHE" >> $GITHUB_ENV
-
           if [ -d "openwrt" ] && [ ! -f "openwrt/scripts/feeds" ]; then
             echo "openwrt incomplete, removing"
             rm -rf openwrt
           fi
-
           if [ ! -d "openwrt" ]; then
             echo "cloning quytttb fork"
             git clone -b main https://github.com/quytttb/immortalwrt-mt798x-rebase.git openwrt
@@ -86,13 +84,11 @@ jobs:
             git pull --rebase || echo "git pull failed, continuing"
             cd "$GITHUB_WORKSPACE"
           fi
-
           if [ -d "openwrt/dl" ] && [ ! -L "openwrt/dl" ]; then
             cp -rn openwrt/dl/. "$DL_CACHE/" 2>/dev/null || true
             rm -rf openwrt/dl
           fi
           ln -sfn "$DL_CACHE" openwrt/dl
-
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
@@ -190,15 +186,12 @@ jobs:
           cp "$GITHUB_WORKSPACE/config/nx32u.config" openwrt/.config
           cd openwrt
           make defconfig
-
           echo "=== check critical packages ==="
           for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
             grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
           done
-
           echo "=== check Kconfig conninfra ==="
           grep -E "CONFIG_MTK_CONNINFRA_APSOC" .config || echo "MISSING: MTK_CONNINFRA_APSOC"
-
           echo "=== check device profile ==="
           grep "CONFIG_TARGET_mediatek_filogic_DEVICE_netis_nx32u=y" .config || {
             echo "ERROR: netis_nx32u profile not activated"
@@ -216,7 +209,6 @@ jobs:
           rm -rf tmp
           echo "=== starting build ==="
           make -j$(nproc) || make -j1 V=s
-
           echo "=== check result ==="
           ls -lh bin/targets/mediatek/filogic/*.itb bin/targets/mediatek/filogic/*.bin bin/targets/mediatek/filogic/*.fip 2>/dev/null || {
             echo "ERROR: no images found"
