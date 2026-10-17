@@ -261,8 +261,8 @@ jobs:
           path: |
             openwrt/bin/targets/mediatek/filogic/*nx32u*
             openwrt/bin/targets/mediatek/filogic/*routerich*
+            openwrt/bin/**/*.apk
             openwrt/bin/targets/mediatek/filogic/sha256sums
-            openwrt/bin/packages/**/*.apk
           if-no-files-found: warn
 
       - name: Upload Build Logs on Failure
