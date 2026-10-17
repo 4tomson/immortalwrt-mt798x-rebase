@@ -1,0 +1,741 @@
+Отличное ревью — все поправки и оговорки легли в точку. Чтобы не плодить патч поверх патча и не держать в голове, что куда клеить при следующем сбое, ниже собран финальный целостный мастер-документ со всеми вклеенными исправлениями, уточнениями и сносками.
+Его можно копировать целиком (Ctrl+A → Ctrl+C) и сразу класть в /root/homeproxy-recovery-notes.md или docs/homeproxy-tuning.md.
+# HomeProxy + AmneziaWG — рабочие конфиги, скрипты и диагностика (Netis NX32U)
+
+Дата сборки: 2026-10-17
+Прошивка: ImmortalWrt 25.12-SNAPSHOT r38634, quytttb
+Ядро: 6.12.112
+Пакетный менеджер: apk
+
+> ⚠️ **ВАЖНО:** не использовать `apk add --force-broken-world`. Эта команда
+> не «разрешает» конфликты, а удаляет из базы мешающие пакеты (`base-files`,
+> `firewall4`, `dnsmasq-full`, `luci`, `kernel`, `ppp` и др.). Последствия — снос
+> файлов с диска и падение `fw4`. При проблемах с версиями ядра — подменять
+> `/lib/apk/db/installed` и `/etc/apk/world` из `/rom`, а не force-флагами.
+
+---
+
+## 1. Главный скрипт: /usr/bin/urltest-refresh (v14.1 — пропатченный)
+
+Управляет пулом узлов, отсеивает мёртвые, сохраняет runtime-ID для AWG и формирует топ-10 + резерв.
+
+```sh
+#!/bin/sh
+# urltest-refresh v14.1 (fixed AWG runtime-ID & head-10 truncation)
+API="[http://127.0.0.1:9090](http://127.0.0.1:9090)"
+LOG="/tmp/urltest-refresh.log"
+LOCK="/var/run/urltest-refresh.lock"
+LAST_FULL="/var/run/urltest-refresh.last-full"
+WORK="/tmp/urltest-work"
+TIMEOUT=5000
+TIMEOUT_AWG=8000
+MAX_DELAY=2500
+PARALLEL=8
+WAIT_API=90
+WAIT_INIT=15
+API_POLL_MAX=30
+FASTPATH_MIN_ALIVE=2
+FULL_INTERVAL=86400
+LOG_MAX=5000
+MODE="${1:-manual}"
+PREF="${2:-}"
+
+log() {
+    msg="$(date '+%F %T') $1"
+    echo "$msg"
+    echo "$msg" >> "$LOG"
+    if [ -f "$LOG" ]; then
+        n=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+        [ "$n" -gt "$LOG_MAX" ] && tail -n $((LOG_MAX/2)) "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    fi
+}
+
+urlenc_tag() { echo "$1" | sed 's/@/%40/g; s/\[/%5B/g; s/\]/%5D/g'; }
+
+if [ -f "$LOCK" ]; then
+    PID=$(cat "$LOCK")
+    kill -0 "$PID" 2>/dev/null && { echo "Уже выполняется (PID $PID)"; exit 1; }
+    rm -f "$LOCK"
+fi
+echo $$ > "$LOCK"
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+CUR_NODES=$(uci get homeproxy.config.main_urltest_nodes 2>/dev/null)
+B_MODE=$(uci get homeproxy.config.main_urltest_mode 2>/dev/null)
+B_PREF=$(uci get homeproxy.config.main_urltest_preferred 2>/dev/null)
+BACKUP_NODES="$CUR_NODES"
+BACKUP_MODE="$B_MODE"
+BACKUP_PREF="$B_PREF"
+
+restore_on_exit() {
+    if [ -f "$WORK/.in_test" ]; then
+        echo "$(date '+%F %T') Восстановление UCI после прерывания" >> "$LOG"
+        uci -q delete homeproxy.config.main_urltest_nodes
+        for id in $BACKUP_NODES; do uci add_list homeproxy.config.main_urltest_nodes="$id"; done
+        [ -n "$BACKUP_MODE" ] && uci set homeproxy.config.main_urltest_mode="$BACKUP_MODE"
+        [ -n "$BACKUP_PREF" ] && uci set homeproxy.config.main_urltest_preferred="$BACKUP_PREF"
+        uci commit homeproxy
+        /etc/init.d/homeproxy reload >>"$LOG" 2>&1
+    fi
+    rm -f "$LOCK"
+    rm -rf "$WORK"
+}
+trap 'restore_on_exit' EXIT INT TERM
+
+log "=== Старт mode=$MODE pref=$PREF ==="
+log "Текущий: $(echo $CUR_NODES | wc -w) узлов, mode=${B_MODE:-auto}, pref=${B_PREF:-нет}"
+
+if { [ "$MODE" = "auto" ] || [ "$MODE" = "manual" ]; } && [ -n "$CUR_NODES" ]; then
+    NOW_TS=$(date +%s)
+    LAST_FULL_TS=$(cat "$LAST_FULL" 2>/dev/null || echo 0)
+    SINCE_FULL=$((NOW_TS - LAST_FULL_TS))
+    if [ "$SINCE_FULL" -lt "$FULL_INTERVAL" ]; then
+        log "Fast-path: тест текущих (с последнего full ${SINCE_FULL}s)..."
+        FAST_OK=0
+        FAST_AWG_OK=0
+        FAST_AWG_TOTAL=0
+        for id in $CUR_NODES; do
+            tag=$(urlenc_tag "cfg-${id}-out")
+            d=$(curl -s --max-time 8 "$API/proxies/$tag/delay?url=[http://www.gstatic.com/generate_204&timeout=$TIMEOUT](http://www.gstatic.com/generate_204&timeout=$TIMEOUT)" 2>/dev/null | grep -o '"delay": *[0-9]*' | grep -o '[0-9]*')
+            is_awg=0
+            t=$(uci -q get "homeproxy.$id.type" 2>/dev/null)
+            case "$t" in amneziawg) is_awg=1;; esac
+            if [ -n "$d" ] && [ "$d" -gt 0 ] && [ "$d" -lt "$MAX_DELAY" ]; then
+                FAST_OK=$((FAST_OK + 1))
+                [ "$is_awg" = "1" ] && FAST_AWG_OK=$((FAST_AWG_OK + 1))
+            fi
+            [ "$is_awg" = "1" ] && FAST_AWG_TOTAL=$((FAST_AWG_TOTAL + 1))
+        done
+        log "  Живых: $FAST_OK из $(echo $CUR_NODES | wc -w) (AWG: $FAST_AWG_OK из $FAST_AWG_TOTAL)"
+        AWG_FAST_OK=1
+        [ "$FAST_AWG_TOTAL" -gt 0 ] && [ "$FAST_AWG_OK" -eq 0 ] && AWG_FAST_OK=0
+        if [ "$FAST_OK" -ge "$FASTPATH_MIN_ALIVE" ] && [ "$AWG_FAST_OK" = "1" ]; then
+            if [ "$MODE" = "manual" ] && [ -n "$B_PREF" ]; then
+                log "  mode=manual, но preferred не пуст — удаляю"
+                uci -q delete homeproxy.config.main_urltest_preferred
+                uci commit homeproxy
+                /etc/init.d/homeproxy reload >>"$LOG" 2>&1
+                log "=== Fast-path + очистка preferred ==="
+                rm -f "$WORK/.in_test"
+                exit 0
+            fi
+            log "=== Fast-path: 0 reload ==="
+            rm -f "$WORK/.in_test"
+            exit 0
+        fi
+        log "  Мало живых или AWG мёртв — полный проход"
+    fi
+fi
+
+# Сбор именованных секций + сохранение runtime-ID (cfgXXXXXX) из CUR_NODES для анонимных AWG
+RAW_NODES=$(uci show homeproxy 2>/dev/null | grep -E '\.type=' \
+    | grep -vE '\.(config|infra|migration|control|routing|dns|subscription|server|automation|multidns)\.' \
+    | sed "s/\.type=.*//; s/homeproxy\.//" | grep -v '^@' | sort -u)
+NODES=$(printf "%s\n%s\n" "$RAW_NODES" "$(echo $CUR_NODES | tr ' ' '\n')" | sort -u | xargs)
+[ -z "$NODES" ] && { log "Нет узлов"; exit 1; }
+
+NODES_NO_AWG=""
+AWG_IDS=""
+for id in $NODES; do
+    t=$(uci -q get "homeproxy.$id.type" 2>/dev/null)
+    case "$t" in
+        amneziawg) AWG_IDS="$AWG_IDS $id" ;;
+        *)         NODES_NO_AWG="$NODES_NO_AWG $id" ;;
+    esac
+done
+NODES_NO_AWG=$(echo $NODES_NO_AWG | xargs)
+AWG_IDS=$(echo $AWG_IDS | xargs)
+TOTAL_MAIN=$(echo $NODES_NO_AWG | wc -w)
+TOTAL_AWG=$(echo $AWG_IDS | wc -w)
+TOTAL=$((TOTAL_MAIN + TOTAL_AWG))
+log "Всего узлов: $TOTAL (main: $TOTAL_MAIN, AWG: $TOTAL_AWG)"
+
+log "Активирую все узлы (temp для теста)..."
+touch "$WORK/.in_test"
+uci -q delete homeproxy.config.main_urltest_nodes
+for id in $NODES; do uci add_list homeproxy.config.main_urltest_nodes="$id"; done
+uci -q set homeproxy.config.main_urltest_mode='manual'
+uci -q delete homeproxy.config.main_urltest_preferred 2>/dev/null
+uci commit homeproxy
+/etc/init.d/homeproxy reload >>"$LOG" 2>&1
+
+log "Жду Clash API (до ${WAIT_API}с)..."
+waited=0
+while [ "$waited" -lt "$WAIT_API" ]; do
+    sleep 3; waited=$((waited + 3))
+    if curl -s --max-time 2 "$API/proxies" 2>/dev/null | grep -q '"proxies"'; then
+        log "  API ответил через ${waited}с"; break
+    fi
+done
+log "  Пауза ${WAIT_INIT}с..."
+sleep $WAIT_INIT
+
+test_node() {
+    id="$1"
+    tmo="${2:-$TIMEOUT}"
+    cmt=$((tmo / 1000 + 6))
+    tag=$(urlenc_tag "cfg-${id}-out")
+    delay=$(curl -s --max-time $cmt "$API/proxies/$tag/delay?url=[http://www.gstatic.com/generate_204&timeout=$tmo](http://www.gstatic.com/generate_204&timeout=$tmo)" 2>/dev/null | grep -o '"delay": *[0-9]*' | grep -o '[0-9]*')
+    if [ -n "$delay" ] && [ "$delay" -gt 0 ] && [ "$delay" -lt "$MAX_DELAY" ]; then
+        echo "$delay $id" >> "$WORK/all.txt"
+        return 0
+    fi
+    return 1
+}
+
+rm -f "$WORK/all.txt"
+: > "$WORK/all.txt"
+
+if [ "$TOTAL_MAIN" -gt 0 ]; then
+    log "Тест main ($TOTAL_MAIN узлов, ${PARALLEL} потоков, ${TIMEOUT}ms)..."
+    batch=""; i=0; n=0
+    for id in $NODES_NO_AWG; do
+        batch="$batch $id"; i=$((i + 1)); n=$((n + 1))
+        if [ $((i % PARALLEL)) -eq 0 ]; then
+            for bid in $batch; do test_node "$bid" & done
+            wait
+            printf "\r  Прогресс: %d/%d" "$n" "$TOTAL_MAIN"
+            batch=""
+        fi
+    done
+    for bid in $batch; do test_node "$bid" & done
+    wait
+    printf "\r  Прогресс: %d/%d — готово\n" "$TOTAL_MAIN" "$TOTAL_MAIN"
+fi
+
+if [ "$TOTAL_AWG" -gt 0 ]; then
+    log "AWG отдельным проходом ($TOTAL_AWG узлов, ${TIMEOUT_AWG}ms)..."
+    for id in $AWG_IDS; do
+        tag=$(urlenc_tag "cfg-${id}-out")
+        w=0
+        found=0
+        while [ "$w" -lt "$API_POLL_MAX" ]; do
+            if curl -s --max-time 2 "$API/proxies/$tag" 2>/dev/null | grep -q '"type"'; then
+                log "  $id — появился в API через ${w}с"
+                found=1
+                break
+            fi
+            sleep 3; w=$((w + 3))
+        done
+        if [ "$found" = "0" ]; then
+            log "  $id — НЕ появился в API за ${API_POLL_MAX}с"
+        else
+            sleep 3
+            t0=$(date +%s)
+            if test_node "$id" "$TIMEOUT_AWG"; then
+                t1=$(date +%s)
+                log "  $id — OK, тест $((t1 - t0))с"
+            else
+                t1=$(date +%s)
+                log "  $id — FAIL, тест $((t1 - t0))с"
+            fi
+        fi
+    done
+fi
+
+OK=$(wc -l < "$WORK/all.txt" 2>/dev/null || echo 0)
+log "Живых: $OK из $TOTAL"
+
+if [ "$OK" -eq 0 ]; then
+    log "0 живых — откат на бэкап"
+    uci -q delete homeproxy.config.main_urltest_nodes
+    for id in $BACKUP_NODES; do uci add_list homeproxy.config.main_urltest_nodes="$id"; done
+    [ -n "$BACKUP_MODE" ] && uci set homeproxy.config.main_urltest_mode="$BACKUP_MODE"
+    uci -q delete homeproxy.config.main_urltest_preferred 2>/dev/null
+    uci commit homeproxy
+    /etc/init.d/homeproxy reload >>"$LOG" 2>&1
+    date +%s > "$LAST_FULL"
+    rm -f "$WORK/.in_test"
+    log "=== Fallback: бэкап восстановлен (0 live) ==="
+    exit 1
+fi
+
+# Сначала отбираем ТОП-10 лучших узлов, и ТОЛЬКО ПОТОМ дописываем упавший AWG
+sort -n "$WORK/all.txt" | awk '!seen[$2]++' | head -10 > "$WORK/sorted.txt"
+
+# AWG всегда в списке (11-м резервным узлом), даже если тест провалился
+for id in $AWG_IDS; do
+    if ! awk -v p="$id" '$2==p {found=1; exit} END {exit !found}' "$WORK/sorted.txt"; then
+        log "  AWG $id тест провалил, но оставляю в пуле резервом (9999ms)"
+        echo "9999 $id" >> "$WORK/sorted.txt"
+    fi
+done
+
+NEW_NODES=""
+BEST=""
+BEST_D=""
+while read d id; do
+    NEW_NODES="$NEW_NODES $id"
+    if [ -z "$BEST" ] && [ "$d" -lt 9000 ]; then
+        BEST="$id"; BEST_D="$d"
+    fi
+done < "$WORK/sorted.txt"
+NEW_NODES=$(echo $NEW_NODES | xargs)
+
+NEW_COUNT=$(echo $NEW_NODES | wc -w)
+log "---"
+log "Живых: $NEW_COUNT"
+log "  Топ-5 по задержке:"
+awk '$1 < 9000' "$WORK/sorted.txt" | head -5 | while read d id; do log "    $id — ${d}ms"; done
+log "Лучший: $BEST (${BEST_D}ms)"
+
+if [ "$MODE" = "test" ]; then
+    log "test: конфиг не меняю, откат к бэкапу"
+    uci -q delete homeproxy.config.main_urltest_nodes
+    for id in $BACKUP_NODES; do uci add_list homeproxy.config.main_urltest_nodes="$id"; done
+    [ -n "$BACKUP_MODE" ] && uci set homeproxy.config.main_urltest_mode="$BACKUP_MODE"
+    [ -n "$BACKUP_PREF" ] && uci set homeproxy.config.main_urltest_preferred="$BACKUP_PREF"
+    uci commit homeproxy
+    /etc/init.d/homeproxy reload >>"$LOG" 2>&1
+    rm -f "$WORK/.in_test"
+    exit 0
+fi
+
+case "$MODE" in
+    manual)
+        if [ -n "$PREF" ]; then
+            if awk -v p="$PREF" '$2==p {found=1; exit} END {exit !found}' "$WORK/all.txt"; then
+                NEW_NODES="$PREF $AWG_IDS"; NEW_COUNT=$(echo $NEW_NODES | wc -w)
+                log "manual: выбран $PREF + AWG"
+            else
+                log "manual: $PREF мёртв — оставляю все живые"
+                NEW_MODE="manual"; NEW_PREF=""
+            fi
+        else
+            NEW_MODE="manual"; NEW_PREF=""
+        fi
+        ;;
+    auto)
+        NEW_MODE="auto"; NEW_PREF=""
+        ;;
+    full|*)
+        NEW_MODE="manual"; NEW_PREF=""
+        ;;
+esac
+
+HS_ON=$(uci -q get homeproxy.config.hotswap 2>/dev/null)
+HS_CNT=$(uci -q get homeproxy.config.hotswap_count 2>/dev/null)
+log "Записываю $NEW_COUNT узлов (mode=$NEW_MODE)"
+log "  hotswap=${HS_ON:-0} count=${HS_CNT:-0}"
+
+uci -q delete homeproxy.config.main_urltest_nodes
+for id in $NEW_NODES; do uci add_list homeproxy.config.main_urltest_nodes="$id"; done
+uci set homeproxy.config.main_urltest_mode="$NEW_MODE"
+if [ -n "$NEW_PREF" ]; then
+    uci set homeproxy.config.main_urltest_preferred="$NEW_PREF"
+else
+    uci -q delete homeproxy.config.main_urltest_preferred 2>/dev/null
+fi
+uci commit homeproxy
+/etc/init.d/homeproxy reload >>"$LOG" 2>&1
+
+date +%s > "$LAST_FULL"
+rm -f "$WORK/.in_test"
+log "=== Готово: $NEW_COUNT живых, mode=$NEW_MODE ==="
+
+Установка:
+cp urltest-refresh /usr/bin/urltest-refresh
+chmod 0755 /usr/bin/urltest-refresh
+
+2. UCI-настройки (uci commit homeproxy)
+Выполнить после установки скрипта.
+> 💡 Примечание по именованию: В конфиге указывается preferred_core='singbox' (или используется бинарник hiddify-core), но файлы рантайма в /var/run/homeproxy/ всегда именуются hiddify-c.json и hiddify-c.log. Это историческое наследие генератора конфигов Re:HomeProxy от upstream-проекта, а не ошибка выбора ядра.
+> 
+# Основные настройки пула и hotswap
+uci set homeproxy.config.main_node='urltest'
+uci set homeproxy.config.main_urltest_mode='manual'
+uci set homeproxy.config.main_urltest_interval='60'
+uci set homeproxy.config.main_urltest_tolerance='150'
+uci set homeproxy.config.hotswap='1'
+uci set homeproxy.config.hotswap_count='2'
+uci set homeproxy.config.hotswap_interval='60'
+uci set homeproxy.config.hotswap_failback='0'
+uci set homeproxy.config.hotswap_antiflap='1'
+uci set homeproxy.config.preferred_core='singbox'
+uci set homeproxy.config.log_level='warn'
+
+# Persistent Cache для .srs
+uci set homeproxy.dns.cache_file_store_rdrc='1'
+uci set homeproxy.dns.cache_file_rdrc_timeout='604800'
+
+# Отключение паразитных гео-проверок
+uci set homeproxy.automation.geo_protect='0'
+uci set homeproxy.automation.geo_scan='0'
+uci set homeproxy.automation.geo_auto_update='0'
+uci set homeproxy.automation.adaptive_timeout='0'
+uci set homeproxy.automation.adaptive_confirm='0'
+
+uci commit homeproxy
+/etc/init.d/homeproxy reload
+
+3. Патчи файлов OpenWrt
+3.1. /etc/init.d/homeproxy (память Go для 256 МБ RAM)
+Найти строку с GOMEMLIMIT (или добавить в start_service()):
+procd_set_param env "GOMEMLIMIT=80MiB" "GOGC=50"
+
+> Оговорка (80/50 vs 128/100): Значения 80MiB / 50 — безопасный потолок по физическому RSS для платы с 238 МБ доступной памяти. Если при сложных правилах маршрутизации в пиках вернутся Go-паники (притом что при 55/30 они были, а на 128/100 прекращались) — откатить на эмпирически проверенный вариант "GOMEMLIMIT=128MiB" "GOGC=100", контролируя RSS по методу из раздела 8.2.
+> 
+3.2. /etc/homeproxy/scripts/generate_client.uc (путь к кэшу)
+Найти строку (около 3105):
+path: RUN_DIR + '/cache.db',
+
+Заменить на:
+path: '/etc/homeproxy/cache.db',
+
+3.3. /etc/sysctl.conf (оптимизация памяти, ZRAM и сети)
+> Примечание: vm.swappiness=60 оптимален именно для ZRAM в оперативной памяти (быстрое сжатие lzo-rle/lz4 без дискового I/O). Для физического swap на USB-флешке ставилось бы 10–20.
+> 
+cat << 'EOF' >> /etc/sysctl.conf
+# Баланс для ZRAM (для дискового swap было бы 10-20)
+vm.swappiness=60
+vm.vfs_cache_pressure=100
+vm.page-cluster=0
+
+# Сетевой стек и BBR
+net.core.default_qdisc=fq_codel
+net.ipv4.tcp_congestion_control=bbr
+net.netfilter.nf_conntrack_max=65536
+EOF
+sysctl -p
+
+3.4. /etc/rc.local (оптимизация прерываний IRQ и очистка tmpfs)
+По умолчанию 99.8% прерываний висит на CPU1. Разносим очереди по разным ядрам (маска 1 = CPU0, маска 2 = CPU1), чтобы не перегружать одно ядро. Вставить перед exit 0:
+[ -f /proc/irq/77/smp_affinity ] && echo 1 > /proc/irq/77/smp_affinity
+[ -f /proc/irq/82/smp_affinity ] && echo 2 > /proc/irq/82/smp_affinity
+
+# Принудительная очистка забытых установочных пакетов в RAM (tmpfs)
+rm -rf /tmp/*.apk
+
+4. Cron (crontab -e)
+0 4 * * * /etc/homeproxy/scripts/reset_automation.sh
+15 * * * * /usr/bin/urltest-refresh >/dev/null 2>&1
+
+5. Сборка прошивки (файл .config)
+Добавить в конец .config для включения AmneziaWG (userspace), аппаратного ускорения, ZRAM и фиксации ядерных модулей (синхронизировано с проверкой workflow из раздела 11.3):
+# ============================================================
+# AmneziaWG userspace tools (kernel module НЕ включаем)
+# ============================================================
+CONFIG_PACKAGE_amneziawg-tools=y
+CONFIG_PACKAGE_awg-quick=y
+CONFIG_PACKAGE_luci-app-amneziawg=y
+
+# ============================================================
+# TProxy, TUN и зависимости для HomeProxy / sing-box / Hiddify
+# ============================================================
+CONFIG_PACKAGE_kmod-tun=y
+CONFIG_PACKAGE_kmod-inet-diag=y
+CONFIG_PACKAGE_kmod-nft-tproxy=y
+CONFIG_PACKAGE_kmod-nft-socket=y
+CONFIG_PACKAGE_kmod-nft-queue=y
+CONFIG_PACKAGE_kmod-nft-fib=y
+CONFIG_PACKAGE_kmod-nft-fullcone=y
+CONFIG_PACKAGE_kmod-wireguard=y
+
+# ============================================================
+# Аппаратное ускорение MediaTek (HNAT + Wi-Fi) и ZRAM (LZ4/LZO)
+# ============================================================
+CONFIG_PACKAGE_kmod-mediatek_hnat=y
+CONFIG_PACKAGE_kmod-mt_wifi=y
+CONFIG_PACKAGE_kmod-warp=y
+CONFIG_PACKAGE_kmod-conninfra=y
+CONFIG_PACKAGE_kmod-zram=y
+CONFIG_PACKAGE_zram-swap=y
+CONFIG_PACKAGE_kmod-lib-lz4=y
+CONFIG_PACKAGE_kmod-crypto-lz4=y
+CONFIG_PACKAGE_kmod-lib-lzo=y
+CONFIG_PACKAGE_kmod-tcp-bbr=y
+
+# ============================================================
+# Force base kernel modules as packages (для apk зависимостей)
+# ============================================================
+CONFIG_PACKAGE_kmod-nf-conntrack=y
+CONFIG_PACKAGE_kmod-nf-nat=y
+CONFIG_PACKAGE_kmod-nf-ipt=y
+CONFIG_PACKAGE_kmod-nf-flow=y
+CONFIG_PACKAGE_kmod-nft-core=y
+CONFIG_PACKAGE_kmod-nft-nat=y
+CONFIG_PACKAGE_kmod-nft-compat=y
+CONFIG_PACKAGE_kmod-nft-netdev=y
+CONFIG_PACKAGE_kmod-nft-offload=y
+CONFIG_PACKAGE_kmod-ipt-core=y
+CONFIG_PACKAGE_kmod-ipt-nat=y
+CONFIG_PACKAGE_kmod-ipv6=y
+CONFIG_PACKAGE_kmod-br-netfilter=y
+CONFIG_PACKAGE_kmod-ebtables=y
+CONFIG_PACKAGE_kmod-sched=y
+CONFIG_PACKAGE_kmod-sched-core=y
+CONFIG_PACKAGE_kmod-pppoe=y
+CONFIG_PACKAGE_kmod-pppox=y
+CONFIG_PACKAGE_kmod-ppp=y
+CONFIG_PACKAGE_kmod-mii=y
+CONFIG_PACKAGE_kmod-lib-crc-ccitt=y
+
+6. Что ещё нужно помнить при восстановлении (из сессии)
+6.1. Версии ядра и extroot
+ * Если база apk на extroot помнит старое ядро (6.12.108) и блокирует установку новых kmod (6.12.112), нужно не использовать --force-broken-world, а подменить метаданные:
+   cp /rom/lib/apk/db/installed /lib/apk/db/installed
+cp /rom/lib/apk/db/scripts.tar /lib/apk/db/scripts.tar
+cp /rom/etc/apk/world /etc/apk/world
+
+   и вручную собрать world из /rom/etc/apk/world + ваши кастомные пакеты (luci-app-re-homeproxy, mc, nmap, темы), убрав старые kernel= и kmod-.
+6.2. Локальная установка kmod из архива
+ * apk ищет индекс по пути $repository/$arch/APKINDEX.tar.gz, поэтому --repository /path работает, только если внутри есть подкаталог aarch64_cortex-a53/.
+ * Надёжнее передавать полные пути к .apk файлам:
+   apk add --allow-untrusted --force-overwrite /path/*.apk
+
+ * --no-network маскирует все пакеты, которые не указаны в командной строке (именно так пропадали libc, libgcc1, kmod-crypto-crc32c). Не использовать в офлайне без явного перечисления всех зависимостей.
+6.3. Firewall и HomeProxy после сбоя
+ * fw4 грузит все файлы из /etc/nftables.d/*.nft. Если остался homeproxy-wg-fix.nft, а сета homeproxy_wan_direct_addr_v4 нет — fw4 падает с No such file or directory. Временно:
+   mv /etc/nftables.d/homeproxy-wg-fix.nft /etc/nftables.d/homeproxy-wg-fix.nft.bak
+/etc/init.d/firewall restart
+
+ * unknown option 'fullcone' — косметика. quytttb-патч fw4 генерирует правила fullcone в nft (проверяется через nft list ruleset | grep -i fullcone), но не объявляет опцию в схеме валидации. Fullcone реально работает, предупреждение игнорируется.
+ * luci-app-re-homeproxy не попадает в стандартный архив сборки — его надо ставить отдельно. Без него ucode-модуль homeproxy не найдётся, и HomeProxy не сможет генерировать свои правила.
+6.4. После массовой переустановки пакетов и контроль памяти
+ * Могут исчезнуть /var/lock и /var/run (если /var — tmpfs, а procd не успел их пересоздать). Симптомы: can't create /var/lock/procd_*.lock и падение служб. Лечится mkdir -p /var/lock /var/run или перезагрузкой.
+ * fw4 status показывает active with no instances — это нормально для fw4, он не регистрируется в procd как инстанс. Ориентироваться на nft list tables | grep fw4 и на фактический NAT.
+ * Проверка потребления памяти ядром (sing-box / hiddify-core):
+   Виртуальная память (VSZ) в top всегда показывает ~1.2–1.3 ГБ — это нормально для Go. Реальный физический расход (RSS) проверяется так:
+   ps w | grep -E 'sing-box|hiddify' | grep -v grep
+grep VmRSS /proc/$(pidof sing-box || pidof hiddify-core)/status
+
+   Если при GOMEMLIMIT=80MiB реальный VmRSS пробивает 120 МиБ и возникают паники/OOM — перейти на конфигурацию 128MiB / GOGC=100.
+6.5. Флешка как extroot — риски
+ * sysupgrade не переносит extroot на новую прошивку автоматически. После обновления придётся заново настраивать монтирование.
+ * Старый слой на extroot (upper/work) содержит несовместимые с новым ядром модули. Перед включением extroot нужно обновить /lib/modules, /lib/apk/db, /etc/apk/world из /rom.
+ * Если флешка нужна только для данных (бинарники, списки), лучше монтировать её как /mnt/usb и использовать mount --bind или симлинки для конкретных файлов, а не переносить /overlay.
+7. Открытые вопросы на следующую итерацию
+ * [ ] Установить luci-app-re-homeproxy (нет в архиве) — без него HomeProxy не работает.
+ * [ ] Вернуть /etc/nftables.d/homeproxy-wg-fix.nft из .bak и include-секции в /etc/config/firewall из firewall.bak после установки пакета.
+ * [ ] Решить, использовать ли extroot. Рекомендация по итогам сессии — остаться на внутренней NAND (128 МБ достаточно), extroot не подключать.
+ * [ ] Сделать backup.tar.gz через LuCI после полной настройки, чтобы не повторять путь с нуля.
+8. Диагностика — быстрые команды
+8.1. Системная нагрузка
+cat /proc/loadavg
+free -h
+for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+    sw=$(grep VmSwap /proc/$pid/status 2>/dev/null | awk '{print $2}')
+    [ -n "$sw" ] && [ "$sw" -gt 100 ] && echo "$sw KB  PID=$pid  $(cat /proc/$pid/comm 2>/dev/null)"
+done | sort -rn | head -10
+
+8.2. HomeProxy / sing-box (hiddify-core)
+# Текущий пул
+uci get homeproxy.config.main_urltest_nodes
+uci get homeproxy.config.main_urltest_mode
+
+# Реальный расход физической памяти (RSS) прокси-ядром
+grep VmRSS /proc/$(pidof sing-box || pidof hiddify-core)/status
+
+# Clash API отвечает?
+curl -s --max-time 3 [http://127.0.0.1:9090/proxies](http://127.0.0.1:9090/proxies) | grep -c '"name"'
+
+# AWG в конфиге? (проверка runtime-ID)
+curl -s --max-time 3 [http://127.0.0.1:9090/proxies](http://127.0.0.1:9090/proxies) | grep -o '"name":"[^"]*@node[^"]*"'
+curl -s --max-time 3 [http://127.0.0.1:9090/proxies](http://127.0.0.1:9090/proxies) | grep -o '"name":"[^"]*cfg[0-9a-f]*[^"]*"'
+
+# Delay конкретного узла (с URL-encode)
+curl -s --max-time 10 "[http://127.0.0.1:9090/proxies/cfg-cfg6446ab-out/delay?url=http://www.gstatic.com/generate_204&timeout=8000](http://127.0.0.1:9090/proxies/cfg-cfg6446ab-out/delay?url=http://www.gstatic.com/generate_204&timeout=8000)"
+
+# Недавние ошибки ядра (hiddify-c.log — имя файла лога от HomeProxy)
+tail -30 /var/run/homeproxy/hiddify-c.log
+
+8.3. Firewall / nftables
+nft list tables | grep fw4
+nft list ruleset | grep -iE 'fullcone|tproxy|dnat' | head -20
+fw4 print 2>/dev/null | head -30
+ls -la /etc/nftables.d/
+
+8.4. Ядерные модули
+# Что загружено
+lsmod | grep -E 'hnat|mt_wifi|warp|wireguard|tun|nft'
+
+# Проверка HNAT (mt7981)
+cat /sys/kernel/debug/hnat/hook_toggle
+cat /sys/kernel/debug/hnat/hnat_stats
+cat /sys/kernel/debug/hnat/hnat_entry | head -20
+
+# Версия ядра
+uname -r
+cat /lib/modules/*/modules.builtin | head
+
+8.5. WiFi и драйвер
+iw dev
+iw dev ra0 station dump | head -20
+logread | grep -iE 'mt_wifi|warp|mt7981' | tail -20
+
+8.6. apk — состояние
+apk info | wc -l
+apk info -a kernel
+apk info -L kernel | head -20
+cat /etc/apk/world
+apk audit 2>/dev/null
+
+8.7. Логи (последние ошибки)
+logread | grep -iE 'error|fail|crash|fatal' | tail -30
+dmesg | tail -50
+tail -50 /tmp/urltest-refresh.log
+
+9. AWG runtime-ID — критичный нюанс (не потерять!)
+Симптом: в UCI AWG лежит как homeproxy.@node[80]=node, type='amneziawg'. В UI отображается как @node[80] и [amneziawg] AmneziaWG двумя записями — это одна и та же анонимная секция.
+Что делает backend: генерирует outbound с тегом cfg-cfg6446ab-out, где cfg6446ab — runtime-ID, вычисляемый при загрузке конфига. UCI-путь @node[80] в API не работает — он возвращает 404 (Resource not found).
+Последствия:
+ * Если записать в main_urltest_nodes @node[80] — sing-box не находит узел, AWG выпадает.
+ * Если записать cfg6446ab — работает, пока анонимные секции не сдвинутся.
+Что делает urltest-refresh v14.1:
+ * Отфильтровывает @node[...] из вывода uci show и подтягивает валидный runtime-ID (cfg6446ab) из текущего CUR_NODES.
+ * Детектит AWG через uci get homeproxy.$id.type → amneziawg.
+ * Сначала отрезает ТОП-10 быстрых VLESS-узлов (head -10), а затем дописывает AWG 11-м узлом в финальный список, даже если тест FAIL (ставит задержку 9999, чтобы URLTest его игнорировал до воскрешения).
+Как проверить правильность:
+uci get homeproxy.config.main_urltest_nodes | tr ' ' '\n' | grep -E 'cfg[0-9a-f]{6,8}'
+curl -s [http://127.0.0.1:9090/proxies](http://127.0.0.1:9090/proxies) | grep -o '"name":"cfg-cfg[0-9a-f]*-out"'
+
+Оба должны показать один и тот же ID. Если UCI показывает @node[80], а API — cfg6446ab — значит в конфиг попала сырая ссылка и пул потеряет AWG.
+10. geo_protect — известный баг нагрузки (не включать!)
+Симптомы при automation.geo_protect='1':
+ * LOAD растёт с 0.3 до 13 за 10 минут.
+ * Swap 125 МБ из 128 (zram).
+ * MemAvail падает до 11 МБ.
+ * Процессы curl висят в D-state по 8–10 секунд.
+ * Порт 5339 (geo-probe) дёргается непрерывно.
+ * В списке процессов: curl ... -x socks5h://127.0.0.1:5339 https://api.openai.com/v1/models, api.ip.sb/geoip, ipwho.is, generativelanguage.googleapis.com.
+Что делает geo_protect:
+Периодически проверяет, что прокси не утекает на geo-запрещённые IP. Реализовано как последовательные curl'ы через SOCKS5 на 5339, каждый с timeout 8–10 секунд. На mt7981 (2 ядра, userspace sing-box) это вызывает конкурентную блокировку: ядро прокси держит соединение, curl ждёт ответа, система свопит в zram, load взлетает.
+Фикс:
+uci set homeproxy.automation.geo_protect='0'
+uci set homeproxy.automation.geo_scan='0'
+uci set homeproxy.automation.geo_auto_update='0'
+uci set homeproxy.automation.adaptive_timeout='0'
+uci set homeproxy.automation.adaptive_confirm='0'
+uci commit homeproxy
+/etc/init.d/homeproxy reload
+
+Проверка что выключено:
+uci show homeproxy.automation | grep -E 'geo_|adaptive_'
+ps w | grep -c 5339   # должно быть 0
+
+11. GitHub Actions workflow — минимальные патчи
+11.1. Фид amneziawg
+В feeds.conf.default (внутри workflow, после git clone):
+cd openwrt
+grep -q 'amneziawg-openwrt' feeds.conf.default || \
+    echo 'src-git amneziawg [https://github.com/slavaz/amneziawg-openwrt.git](https://github.com/slavaz/amneziawg-openwrt.git)' >> feeds.conf.default
+
+Проверка: ./scripts/feeds search amneziawg должно вернуть amneziawg-tools, awg-quick, luci-app-amneziawg.
+11.2. Зависимости сборки (Ubuntu 22.04)
+Помимо базового списка, добавь:
+sudo apt-get -y install \
+    libelf-dev libmnl-dev libnftnl-dev \
+    pkg-config bison flex libncurses-dev \
+    python3-distutils rsync unzip
+
+libelf-dev и libmnl-dev нужны для сборки amneziawg-tools и kmod-amneziawg. Без них падает configure или make -C tools.
+11.3. Проверка в workflow
+Добавь шаг после Apply Config:
+- name: Verify AmneziaWG + kernel packages
+  run: |
+    cd openwrt
+    echo "=== AmneziaWG ==="
+    for pkg in amneziawg-tools awg-quick luci-app-amneziawg; do
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config \
+            && echo "OK: $pkg" \
+            || echo "MISSING: $pkg"
+    done
+    echo "=== Kernel modules as packages ==="
+    for pkg in kmod-nf-conntrack kmod-nft-core kmod-nft-nat \
+               kmod-ipv6 kmod-tun kmod-nft-tproxy kmod-nft-socket \
+               kmod-mt_wifi kmod-warp kmod-conninfra kmod-mediatek_hnat \
+               kmod-wireguard kmod-zram; do
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config \
+            && echo "OK: $pkg" \
+            || echo "MISSING: $pkg"
+    done
+    echo "=== Package Makefiles present ==="
+    for pkg in amneziawg-tools awg-quick; do
+        find feeds/ package/ -path "*${pkg}/Makefile" 2>/dev/null | head -1
+    done
+
+11.4. Дополнительный шаг: диагностика missing packages
+Если make defconfig выкидывает CONFIG_PACKAGE_kmod-xxx=y (пишет is not set), это значит, что KernelPackage/xxx не объявлен в фидах. Добавь:
+- name: Detect missing KernelPackages
+  run: |
+    cd openwrt
+    make defconfig
+    for pkg in $(grep -oE '^CONFIG_PACKAGE_kmod-[a-z0-9_-]+' config/*.config | sed 's/CONFIG_PACKAGE_//' | sort -u); do
+        name=${pkg#kmod-}
+        grep -qE "KernelPackage/${name}\b" \
+            $(find package/ feeds/ -name 'Makefile' 2>/dev/null) 2>/dev/null \
+            || echo "MISSING KernelPackage: $name"
+    done
+
+11.5. Что НЕ включать
+ * CONFIG_PACKAGE_kmod-amneziawg — используется userspace-реализация AWG внутри sing-box/hiddify-core. Kernel-модуль создаст awg0-подобный интерфейс, который прокси-ядро использовать не будет (+100 КБ веса без профита).
+ * CONFIG_PACKAGE_kmod-udptunnel4/6 — нужны только для kmod-amneziawg.
+12. Быстрое восстановление после сбоя
+12.1. Firewall не стартует
+Симптом: fw4 в логах с No such file or directory на @homeproxy_wan_direct_addr_v4 или другой сет.
+mkdir -p /tmp/nft-backup
+mv /etc/nftables.d/*.nft /tmp/nft-backup/   # убрать все homeproxy-инклюды
+/etc/init.d/firewall restart
+# если заработал — возвращать по одному и смотреть, какой ломает:
+mv /tmp/nft-backup/*.nft /etc/nftables.d/  # вернуть, оставить только нужный
+
+12.2. HomeProxy не запускается после обновления
+# Проверить, что backend живой и скрипты на месте
+which sing-box || which hiddify-core
+ls /etc/homeproxy/scripts/
+
+# Если пакет интерфейса пропал — установить локально с флагом доверия
+apk add --allow-untrusted /tmp/luci-app-re-homeproxy*.apk /tmp/luci-i18n-homeproxy-ru*.apk
+rm -f /tmp/*.apk
+
+# Пересобрать конфиг
+/etc/init.d/homeproxy reload
+sleep 5
+tail -30 /var/run/homeproxy/hiddify-c.log
+
+12.2.1. Нюанс с пакетом ядра (hiddify-core.apk) и зависимостями kmod в apk
+Пакет hiddify-core.apk жёстко требует kmod-inet-diag, kmod-nft-queue, kmod-tun. Если модули вкомпилированы в ядро статически (=y), но отсутствуют как записи в /lib/apk/db/installed, apk блокирует установку, а ручная перепаковка архива через tar выдаёт v2 package format error.
+ * Решение: Бинарник ядра кладётся напрямую в /usr/bin/ с правами 0755, а из /etc/apk/world вычищаются упоминания hiddify-core и этих kmod:
+   sed -i -E '/hiddify-core|kmod-inet-diag|kmod-nft-queue|kmod-tun/d' /etc/apk/world
+
+   > ⚠️ Оговорка: Удалять kmod-* из /etc/apk/world безопасно только тогда, когда модули реально вкомпилированы в ядро. Если они установлены как внешние .apk-пакеты, удаление их из world приведёт к тому, что apk сотрёт их при следующей проверке/очистке зависимостей.
+   > 
+12.3. Все узлы мертвы
+# Принудительно в manual, все узлы в тест
+uci set homeproxy.config.main_urltest_mode='manual'
+uci commit homeproxy
+/usr/bin/urltest-refresh full
+sleep 30
+uci get homeproxy.config.main_urltest_nodes | tr ' ' '\n' | wc -l
+
+12.4. apk сломан (падает на db или world)
+# Восстановить из /rom (squashfs — неизменяем, там оригинал)
+cp /rom/lib/apk/db/installed /lib/apk/db/installed
+cp /rom/lib/apk/db/scripts.tar /lib/apk/db/scripts.tar
+cp /rom/etc/apk/world /etc/apk/world
+
+# Дописать кастомные пакеты из репо (НЕ запускать apk upgrade на snapshot!)
+apk update
+for pkg in mc nmap luci-theme-aurora; do
+    apk add "$pkg" 2>/dev/null || true
+done
+
+12.5. Полный сброс к заводским + восстановление из бекапа
+# 1. Бекап важного (делается через LuCI: System → Backup → Generate archive)
+# 2. Если есть /root/backup-*.tar.gz — развернуть
+tar xzf /root/backup-*.tar.gz -C /
+# 3. Перезагрузка
+reboot
+
+13. Что НЕ делать (анти-паттерны из этой сессии)
+| ❌ Не делать | Почему |
+|---|---|
+| apk add --force-broken-world | Удаляет пакеты из БД вместо разрешения конфликтов (base-files, firewall4, dnsmasq-full). Сносит файлы с диска. |
+| apk upgrade на snapshot-прошивке | В ветке SNAPSHOT хэши ядра в онлайн-репо меняются ежедневно. Команда попытается подтянуть несовместимые kmod и разрушит систему. |
+| --no-network в офлайне без явного списка | Маскирует все пакеты, не указанные в командной строке (libc, libgcc1 пропадают). |
+| Оставлять скачанные .apk в /tmp | /tmp размещён в RAM (tmpfs). Забытый hiddify-core.apk отнимает ~26.3 МБ физической оперативной памяти. |
+| Записывать в main_urltest_nodes через uci add_list @node[80] | Backend не понимает UCI-путь, AWG выпадает. Нужен runtime-ID (cfgXXXXXX). |
+| Включать geo_protect='1' на слабом CPU | Даёт load 13, swap 125 МБ, D-state curl'ов. |
+| Переносить /overlay на USB без обновления /lib/modules | После смены ядра — все kmod-пакеты перестают работать. |
+| Возвращать banip | Ранее удалён как паразит, при возврате снова даёт нагрузку. |
+| uci commit без reload после правок | Изменения не применяются, ядро прокси продолжает работать по старому конфигу. |
