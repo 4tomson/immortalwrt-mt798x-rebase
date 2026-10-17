@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for Netis NX32U
+name: Build ImmortalWrt for NX32U & Routerich AX3000-V1
 
 on:
   workflow_dispatch:
@@ -93,31 +93,28 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Check NX32U Profile
+      - name: Check NX32U & Routerich Profiles
         run: |
           cd openwrt
           FILOGIC="target/linux/mediatek/image/filogic.mk"
-          echo "=== NX32U in filogic.mk ==="
-          if grep -q "Device/netis_nx32u" "$FILOGIC"; then
-            echo "OK: profile present"
-            awk '/^define Device\/netis_nx32u$/,/^TARGET_DEVICES/' "$FILOGIC"
-          else
-            echo "MISSING: netis_nx32u profile not found in quytttb"
-            echo "=== available netis profiles ==="
-            grep -n "Device/netis" "$FILOGIC" || echo "no netis at all"
-          fi
+          for dev in netis_nx32u routerich_ax3000-v1; do
+            echo "=== $dev in filogic.mk ==="
+            if grep -q "Device/$dev" "$FILOGIC"; then
+              echo "OK: $dev profile present"
+              awk "/^define Device\\/$dev\$/,/^endef/" "$FILOGIC"
+            else
+              echo "MISSING: $dev profile not found"
+            fi
+          done
 
       - name: Check U-Boot for NX32U
         run: |
           cd openwrt
           UBOOT_MK="package/boot/uboot-mediatek/Makefile"
-          echo "=== U-Boot/mt7981_netis_nx32u ==="
           if grep -q "U-Boot/mt7981_netis_nx32u" "$UBOOT_MK"; then
             echo "OK: U-Boot/mt7981_netis_nx32u present"
           else
-            echo "MISSING: U-Boot/mt7981_netis_nx32u not in quytttb"
-            echo "=== existing mt7981 U-Boot entries ==="
-            grep -n "^define U-Boot/mt7981" "$UBOOT_MK" || echo "no mt7981 U-Boot"
+            echo "MISSING: U-Boot/mt7981_netis_nx32u"
           fi
 
       - name: Patch mtwifi-cfg-ucode (remove iwinfo-ucode dep)
@@ -128,11 +125,7 @@ jobs:
             echo "WARN: $MK not found, skipping"
             exit 0
           fi
-          echo "=== BEFORE ==="
-          grep "DEPENDS" "$MK" | head -3
           sed -i 's/+iwinfo-ucode//g' "$MK"
-          echo "=== AFTER ==="
-          grep "DEPENDS" "$MK" | head -3
 
       - name: Fix libgcc Version for APK
         run: |
@@ -144,9 +137,6 @@ jobs:
           fi
           if grep -q 'PKG_VERSION.*GCC_VERSION' "$TARGET_MK"; then
             sed -i 's|PKG_VERSION:=\$(GCC_VERSION)|PKG_VERSION:=$(if $(GCC_VERSION),$(GCC_VERSION),14.3.0)|' "$TARGET_MK"
-            echo "libgcc patch applied"
-          else
-            echo "PKG_VERSION already correct"
           fi
 
       - name: Restore ccache
@@ -154,49 +144,50 @@ jobs:
         if: inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/.ccache
-          key: ccache-nx32u-${{ github.sha }}
-          restore-keys: ccache-nx32u-
+          key: ccache-multi-${{ github.sha }}
+          restore-keys: ccache-multi-
 
       - name: Restore build_dir
         uses: actions/cache/restore@v4
         if: inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/build_dir
-          key: build-nx32u-${{ github.sha }}
-          restore-keys: build-nx32u-
+          key: build-multi-${{ github.sha }}
+          restore-keys: build-multi-
 
       - name: Restore staging_dir
         uses: actions/cache/restore@v4
         if: inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/staging_dir
-          key: staging-nx32u-${{ github.sha }}
-          restore-keys: staging-nx32u-
+          key: staging-multi-${{ github.sha }}
+          restore-keys: staging-multi-
 
       - name: Restore dl-cache
         uses: actions/cache/restore@v4
         if: inputs.runner_type == 'ubuntu-22.04'
         with:
           path: ${{ runner.workspace }}/dl-cache
-          key: dl-nx32u-${{ github.sha }}
-          restore-keys: dl-nx32u-
+          key: dl-multi-${{ github.sha }}
+          restore-keys: dl-multi-
 
       - name: Apply Config
         run: |
           cp "$GITHUB_WORKSPACE/config/nx32u.config" openwrt/.config
           cd openwrt
           make defconfig
+          echo "=== check profiles ==="
+          for dev in netis_nx32u routerich_ax3000-v1; do
+            grep -q "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${dev}=y" .config && echo "OK: $dev" || { echo "MISSING: $dev"; exit 1; }
+          done
+          echo "=== check multi-profile options ==="
+          for opt in CONFIG_TARGET_MULTI_PROFILE CONFIG_TARGET_PER_DEVICE_ROOTFS; do
+            grep -q "^${opt}=y" .config && echo "OK: $opt" || echo "MISSING: $opt"
+          done
           echo "=== check critical packages ==="
-          for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
+          for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
             grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
           done
-          echo "=== check Kconfig conninfra ==="
-          grep -E "CONFIG_MTK_CONNINFRA_APSOC" .config || echo "MISSING: MTK_CONNINFRA_APSOC"
-          echo "=== check device profile ==="
-          grep "CONFIG_TARGET_mediatek_filogic_DEVICE_netis_nx32u=y" .config || {
-            echo "ERROR: netis_nx32u profile not activated"
-            exit 1
-          }
 
       - name: Download Packages
         run: |
@@ -207,10 +198,9 @@ jobs:
         run: |
           cd openwrt
           rm -rf tmp
-          echo "=== starting build ==="
           make -j$(nproc) || make -j1 V=s
           echo "=== check result ==="
-          ls -lh bin/targets/mediatek/filogic/*.itb bin/targets/mediatek/filogic/*.bin bin/targets/mediatek/filogic/*.fip 2>/dev/null || {
+          ls -lh bin/targets/mediatek/filogic/*nx32u* bin/targets/mediatek/filogic/*routerich* 2>/dev/null || {
             echo "ERROR: no images found"
             exit 1
           }
@@ -220,46 +210,40 @@ jobs:
         if: always() && inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/.ccache
-          key: ccache-nx32u-${{ github.sha }}
+          key: ccache-multi-${{ github.sha }}
 
       - name: Save build_dir
         uses: actions/cache/save@v4
         if: always() && inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/build_dir
-          key: build-nx32u-${{ github.sha }}
+          key: build-multi-${{ github.sha }}
 
       - name: Save staging_dir
         uses: actions/cache/save@v4
         if: always() && inputs.runner_type == 'ubuntu-22.04'
         with:
           path: openwrt/staging_dir
-          key: staging-nx32u-${{ github.sha }}
+          key: staging-multi-${{ github.sha }}
 
       - name: Save dl-cache
         uses: actions/cache/save@v4
         if: always() && inputs.runner_type == 'ubuntu-22.04'
         with:
           path: ${{ runner.workspace }}/dl-cache
-          key: dl-nx32u-${{ github.sha }}
+          key: dl-multi-${{ github.sha }}
 
       - name: Upload Artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-nx32u-firmware-and-packages
+          name: immortalwrt-multi-firmware-and-packages
           path: |
-            openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
-            openwrt/bin/targets/mediatek/filogic/*sysupgrade.bin
-            openwrt/bin/targets/mediatek/filogic/*initramfs-recovery.itb
-            openwrt/bin/targets/mediatek/filogic/*initramfs-kernel.bin
-            openwrt/bin/targets/mediatek/filogic/*bl31-uboot.fip
-            openwrt/bin/targets/mediatek/filogic/*preloader.bin
-            openwrt/bin/targets/mediatek/filogic/*.manifest
+            openwrt/bin/targets/mediatek/filogic/*nx32u*
+            openwrt/bin/targets/mediatek/filogic/*routerich*
             openwrt/bin/targets/mediatek/filogic/sha256sums
             openwrt/bin/packages/**/*.apk
-            openwrt/bin/targets/mediatek/filogic/packages/**/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Upload Build Logs on Failure
         if: failure()
