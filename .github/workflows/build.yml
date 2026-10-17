@@ -247,7 +247,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-nx32u-firmware
+          name: immortalwrt-nx32u-firmware-and-packages
           path: |
             openwrt/bin/targets/mediatek/filogic/*sysupgrade.itb
             openwrt/bin/targets/mediatek/filogic/*sysupgrade.bin
@@ -257,6 +257,8 @@ jobs:
             openwrt/bin/targets/mediatek/filogic/*preloader.bin
             openwrt/bin/targets/mediatek/filogic/*.manifest
             openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/bin/packages/**/*.apk
+            openwrt/bin/targets/mediatek/filogic/packages/**/*.apk
           if-no-files-found: error
 
       - name: Upload Build Logs on Failure
