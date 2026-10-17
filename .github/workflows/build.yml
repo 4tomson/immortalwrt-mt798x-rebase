@@ -93,6 +93,22 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Patch filogic.mk (remove mainline Wi-Fi pkgs from netis_nx32u)
+        run: |
+          cd openwrt
+          MK="target/linux/mediatek/image/filogic.mk"
+          if [ ! -f "$MK" ]; then
+            echo "ERROR: $MK not found"
+            exit 1
+          fi
+          echo "=== BEFORE: netis_nx32u DEVICE_PACKAGES ==="
+          awk '/^define Device\/netis_nx32u$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+          sed -i 's/kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware //g' "$MK"
+          echo "=== AFTER: netis_nx32u DEVICE_PACKAGES ==="
+          awk '/^define Device\/netis_nx32u$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+          echo "=== AFTER: routerich_ax3000-v1 DEVICE_PACKAGES ==="
+          awk '/^define Device\/routerich_ax3000-v1$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+
       - name: Check NX32U & Routerich Profiles
         run: |
           cd openwrt
@@ -187,6 +203,10 @@ jobs:
           echo "=== check critical packages ==="
           for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
             grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
+          done
+          echo "=== check kmod-as-module (=m) ==="
+          for pkg in kmod-nft-tproxy kmod-tun kmod-nft-socket kmod-inet-diag kmod-netlink-diag kmod-nft-fullcone; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=m" .config && echo "OK: $pkg=m" || echo "MISSING: $pkg=m"
           done
 
       - name: Download Packages
