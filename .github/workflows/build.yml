@@ -1,0 +1,636 @@
+name: Build ImmortalWrt for 3 Routers (NX32U, Routerich V1, Routerich)
+
+# ─── Changelog ──────────────────────────────────────────────────────
+#   1. base_repo: chasey-dev (25.12) / 4tomson (main)
+#   2. USB 3.0 fixes: apply-usb3-fixes.sh из корня репо применяется к 117 патчу
+#   3. Compile AmneziaWG Only: 3 попытки (direct > toolchain+headers > full)
+#   4. dl-cache/ccache/build_dir/staging_dir ключи разделены по base_repo
+#   5. packages-all — общий артефакт с пакетами
+#   6. Validate firmware: размер + amneziawg.ko
+#   7. build-info.txt: Post-flash notes
+# ────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: 'База для сборки (chasey-dev = основная, 4tomson = fallback)'
+        required: true
+        type: choice
+        default: 'chasey-dev'
+        options:
+          - chasey-dev
+          - 4tomson
+      runner_type:
+        description: 'Где собирать?'
+        required: true
+        type: choice
+        default: 'self-hosted'
+        options:
+          - self-hosted
+          - ubuntu-22.04
+      build_amneziawg_only:
+        description: 'Собрать ТОЛЬКО пакеты AmneziaWG (без прошивки)'
+        type: boolean
+        default: false
+      force_clean:
+        description: 'ПОЛНАЯ ОЧИСТКА (build_dir, staging_dir, ccache, tmp)?'
+        type: boolean
+        default: false
+      clean_kernel:
+        description: 'Очистить только ядро (для новых патчей)?'
+        type: boolean
+        default: false
+      clean_packages:
+        description: 'Очистить собранные пакеты (make package/clean)?'
+        type: boolean
+        default: false
+      clean_toolchain:
+        description: 'Очистить тулчейн и staging_dir (долго)?'
+        type: boolean
+        default: false
+      wipe_source:
+        description: 'Удалить openwrt и клонировать заново?'
+        type: boolean
+        default: false
+      skip_update:
+        description: 'Пропустить git pull?'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_type }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Wipe Source (if requested)
+        if: ${{ inputs.wipe_source }}
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/openwrt" 2>/dev/null || true
+          echo "OK: openwrt removed"
+
+      - name: Install Dependencies
+        run: |
+          MISSING=""
+          for pkg in build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev python3-setuptools python3-dev swig rsync unzip zlib1g-dev file wget ccache patchutils squashfs-tools; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || MISSING="$MISSING $pkg"
+          done
+          if [ -n "$MISSING" ]; then
+            sudo apt-get update
+            sudo apt-get -y install $MISSING
+          else
+            echo "OK: all deps installed"
+          fi
+
+      - name: Clone or Update Source
+        id: clone
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          DL_CACHE="$RUNNER_WORKSPACE/dl-cache"
+          mkdir -p "$DL_CACHE"
+          echo "DL_CACHE=$DL_CACHE" >> $GITHUB_ENV
+
+          # ─── Выбор базы и ветки ───
+          BASE="${{ inputs.base_repo }}"
+          if [ "$BASE" = "chasey-dev" ]; then
+            REPO="https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git"
+            BRANCH="25.12"
+            PATCH_SOURCE=""
+          else
+            REPO="https://github.com/4tomson/immortalwrt-mt798x-rebase.git"
+            BRANCH="main"
+            PATCH_SOURCE=""
+          fi
+          echo "BASE=$BASE" >> $GITHUB_ENV
+          echo "REPO=$REPO" >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "Selected base: $BASE ($REPO, branch: $BRANCH)"
+
+          # ─── Защита: если remote в существующей openwrt/ не совпадает ───
+          if [ -d "openwrt" ] && [ -d "openwrt/.git" ]; then
+            CUR_REMOTE=$(cd openwrt && git remote get-url origin 2>/dev/null || echo "")
+            if [ "$CUR_REMOTE" != "$REPO" ]; then
+              echo "WARN: remote mismatch (current=$CUR_REMOTE, requested=$REPO)"
+              echo "WARN: wiping openwrt to avoid cross-fork contamination"
+              rm -rf openwrt
+            fi
+          fi
+
+          # ─── Неполный клон ───
+          if [ -d "openwrt" ] && [ ! -f "openwrt/scripts/feeds" ]; then
+            echo "openwrt incomplete, removing"
+            rm -rf openwrt
+          fi
+
+          # ─── Клонирование / обновление ───
+          if [ ! -d "openwrt" ]; then
+            echo "cloning $BASE (branch: $BRANCH)"
+            git clone -b "$BRANCH" "$REPO" openwrt
+          elif [ "${{ inputs.skip_update }}" == "true" ]; then
+            echo "skip_update=true"
+          else
+            cd openwrt
+            CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+            if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
+              echo "WARN: branch mismatch (current=$CURRENT_BRANCH, requested=$BRANCH)"
+              echo "WARN: checking out $BRANCH"
+              git fetch origin "$BRANCH" 2>/dev/null || true
+              git checkout "$BRANCH" 2>/dev/null || {
+                echo "ERROR: cannot checkout branch $BRANCH"
+                exit 1
+              }
+            fi
+            git checkout -- . 2>/dev/null || true
+            git clean -fd feeds/ package/ toolchain/ target/ 2>/dev/null || true
+            git pull --rebase || echo "git pull failed, continuing"
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          # ─── dl-cache ───
+          if [ -d "openwrt/dl" ] && [ ! -L "openwrt/dl" ]; then
+            cp -rn openwrt/dl/. "$DL_CACHE/" 2>/dev/null || true
+            rm -rf openwrt/dl
+          fi
+          ln -sfn "$DL_CACHE" openwrt/dl
+
+          cd openwrt
+
+          # ─── Фиды ───
+          if ! grep -q "awgopenwrt" feeds.conf.default; then
+            echo "src-git awgopenwrt https://github.com/this-username-has-been-taken/amneziawg-openwrt.git" >> feeds.conf.default
+          fi
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          echo "=== Available AmneziaWG packages in feeds ==="
+          ./scripts/feeds list 2>/dev/null | grep -Ei 'amnezia|awg' || echo "WARN: no amneziawg packages in feeds"
+
+          # ─── USB 3.0 fixes (apply-usb3-fixes.sh из корня репо) ───
+          USB_FIX_SCRIPT="$GITHUB_WORKSPACE/apply-usb3-fixes.sh"
+          PATCH_PATH="target/linux/mediatek/patches-6.12/117-complete-mt7981b-dtsi.patch"
+
+          if [ -f "$USB_FIX_SCRIPT" ] && [ -f "$PATCH_PATH" ]; then
+            echo "=== Applying USB 3.0 fixes to 117 patch ==="
+            sh "$USB_FIX_SCRIPT" "$PATCH_PATH"
+          else
+            echo "WARN: $USB_FIX_SCRIPT or $PATCH_PATH missing, skipping USB fixes"
+          fi
+
+          # ─── Проверка: патч 117 содержит USB 3.0 фикс ───
+          if [ -f "$PATCH_PATH" ] && grep -q 'mediatek,mt7981-tphy' "$PATCH_PATH" && grep -q 'nvmem-cell-names = "intr", "rx_imp", "tx_imp"' "$PATCH_PATH"; then
+            echo "OK: 117 patch contains USB 3.0 fixes (mt7981-tphy + nvmem-cells)"
+          else
+            echo "ERROR: 117 patch missing USB 3.0 fixes (mt7981-tphy or nvmem-cells)"
+            exit 1
+          fi
+
+          # ─── Проверка профиля routerich_ax3000-v1 ───
+          FILOGIC="target/linux/mediatek/image/filogic.mk"
+          if grep -q "Device/routerich_ax3000-v1" "$FILOGIC"; then
+            echo "OK: routerich_ax3000-v1 profile present in $BASE"
+          else
+            echo "ERROR: routerich_ax3000-v1 profile MISSING in $BASE"
+            exit 1
+          fi
+
+          OPENWRT_REV=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          echo "OPENWRT_REV=$OPENWRT_REV" >> $GITHUB_ENV
+          echo "openwrt_rev=$OPENWRT_REV" >> $GITHUB_OUTPUT
+          echo "OpenWrt base: $BASE @ $BRANCH @ $OPENWRT_REV"
+
+      # --- ФИКС ПАТЧА 117: гарантируем правильные счётчики ханков ---
+      - name: Fix 117 patch (verify content + recount counters)
+        run: |
+          PATCH=openwrt/target/linux/mediatek/patches-6.12/117-complete-mt7981b-dtsi.patch
+          if [ ! -f "$PATCH" ]; then
+            echo "ERROR: $PATCH not found"
+            exit 1
+          fi
+
+          echo "=== Content verification ==="
+          grep -q 'mediatek,mt7981-tphy' "$PATCH" \
+            || { echo "FAIL: compatible = mediatek,mt7981-tphy missing"; exit 1; }
+          grep -q 'nvmem-cell-names = "intr", "rx_imp", "tx_imp"' "$PATCH" \
+            || { echo "FAIL: nvmem-cells/nvmem-cell-names in u3port0 missing"; exit 1; }
+          echo "OK: required lines present"
+
+          echo "=== Recounting hunk headers ==="
+          if command -v recountdiff >/dev/null 2>&1; then
+            recountdiff "$PATCH" > /tmp/117.patch
+            mv /tmp/117.patch "$PATCH"
+            echo "OK: recountdiff applied"
+          else
+            echo "ERROR: recountdiff not found (install patchutils)"
+            exit 1
+          fi
+
+          echo "=== Show resulting hunk headers ==="
+          grep -n '^@@' "$PATCH"
+
+      # --- БЛОК ОЧИСТОК ---
+      - name: Full Clean (if requested)
+        if: ${{ inputs.force_clean }}
+        run: |
+          cd openwrt
+          make dirclean >/dev/null 2>&1 || true
+          rm -rf build_dir staging_dir .ccache tmp logs
+          echo "OK: FULL clean completed"
+
+      - name: Clean Kernel Only (if requested)
+        if: ${{ inputs.clean_kernel && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          make target/linux/clean
+          echo "OK: kernel clean completed"
+
+      - name: Clean Packages Only (if requested)
+        if: ${{ inputs.clean_packages && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          make package/clean
+          echo "OK: packages clean completed"
+
+      - name: Clean Toolchain Only (if requested)
+        if: ${{ inputs.clean_toolchain && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          rm -rf staging_dir toolchain
+          echo "OK: toolchain clean completed"
+
+      - name: Patch filogic.mk (remove mainline Wi-Fi pkgs from all 3 devices)
+        run: |
+          cd openwrt
+          MK="target/linux/mediatek/image/filogic.mk"
+          if [ ! -f "$MK" ]; then
+            echo "ERROR: $MK not found"
+            exit 1
+          fi
+          echo "=== BEFORE: netis_nx32u DEVICE_PACKAGES ==="
+          awk '/^define Device\/netis_nx32u$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+          sed -i 's/kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware //g' "$MK"
+          echo "=== AFTER: netis_nx32u DEVICE_PACKAGES ==="
+          awk '/^define Device\/netis_nx32u$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+
+          echo "=== AFTER: routerich_ax3000-v1 DEVICE_PACKAGES ==="
+          awk '/^define Device\/routerich_ax3000-v1$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+
+          echo "=== AFTER: routerich_ax3000 DEVICE_PACKAGES ==="
+          awk '/^define Device\/routerich_ax3000$/,/^endef/' "$MK" | grep -E 'DEVICE_PACKAGES'
+
+      - name: Check NX32U & Both Routerich Profiles
+        run: |
+          cd openwrt
+          FILOGIC="target/linux/mediatek/image/filogic.mk"
+          for dev in netis_nx32u routerich_ax3000-v1 routerich_ax3000; do
+            echo "=== $dev in filogic.mk ==="
+            if grep -q "Device/$dev" "$FILOGIC"; then
+              echo "OK: $dev profile present"
+              awk "/^define Device\\/$dev\$/,/^endef/" "$FILOGIC"
+            else
+              echo "MISSING: $dev profile not found"
+            fi
+          done
+
+      - name: Check U-Boot for NX32U
+        run: |
+          cd openwrt
+          UBOOT_MK="package/boot/uboot-mediatek/Makefile"
+          if grep -q "U-Boot/mt7981_netis_nx32u" "$UBOOT_MK"; then
+            echo "OK: U-Boot/mt7981_netis_nx32u present"
+          else
+            echo "MISSING: U-Boot/mt7981_netis_nx32u"
+          fi
+
+      - name: Patch mtwifi-cfg-ucode (remove iwinfo-ucode dep)
+        run: |
+          cd openwrt
+          MK="package/mtk/applications/mtwifi-cfg-ucode/Makefile"
+          if [ ! -f "$MK" ]; then
+            echo "WARN: $MK not found, skipping"
+            exit 0
+          fi
+          sed -i 's/+iwinfo-ucode//g' "$MK"
+
+      - name: Fix libgcc Version for APK
+        run: |
+          cd openwrt
+          TARGET_MK="feeds/base/libs/toolchain/Makefile"
+          if [ ! -f "$TARGET_MK" ]; then
+            echo "toolchain Makefile not found, skipping"
+            exit 0
+          fi
+          if grep -q 'PKG_VERSION.*GCC_VERSION' "$TARGET_MK"; then
+            sed -i 's|PKG_VERSION:=\$(GCC_VERSION)|PKG_VERSION:=$(if $(GCC_VERSION),$(GCC_VERSION),14.3.0)|' "$TARGET_MK"
+          fi
+
+      # ─── Кеши разделены по base_repo ───
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ inputs.base_repo }}-
+            ccache-
+
+      - name: Restore build_dir
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04' && !inputs.force_clean && !inputs.clean_kernel
+        with:
+          path: openwrt/build_dir
+          key: build-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ inputs.base_repo }}-
+            build-
+
+      - name: Restore staging_dir
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04' && !inputs.force_clean && !inputs.clean_toolchain
+        with:
+          path: openwrt/staging_dir
+          key: staging-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            staging-${{ inputs.base_repo }}-
+            staging-
+
+      - name: Restore dl-cache
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: ${{ runner.workspace }}/dl-cache
+          key: dl-${{ inputs.base_repo }}-${{ steps.clone.outputs.openwrt_rev || github.sha }}
+          restore-keys: dl-${{ inputs.base_repo }}-
+
+      - name: Apply Config
+        run: |
+          cp "$GITHUB_WORKSPACE/config/nx32u.config" openwrt/.config
+          cd openwrt
+
+          sed -i '/luci-app-re-homeproxy/d' .config
+          sed -i '/luci-i18n.*homeproxy/d' .config
+
+          sed -i 's/^CONFIG_PACKAGE_kmod-wireguard=y/# CONFIG_PACKAGE_kmod-wireguard is not set/' .config
+          if ! grep -q '^# CONFIG_PACKAGE_kmod-wireguard is not set' .config; then
+            echo '# CONFIG_PACKAGE_kmod-wireguard is not set' >> .config
+          fi
+          for pkg in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+            fi
+          done
+
+          make defconfig
+
+          echo "=== check profiles ==="
+          for dev in netis_nx32u routerich_ax3000-v1 routerich_ax3000; do
+            grep -q "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${dev}=y" .config && echo "OK: $dev" || { echo "MISSING: $dev"; exit 1; }
+          done
+
+          echo "=== check multi-profile options ==="
+          for opt in CONFIG_TARGET_MULTI_PROFILE CONFIG_TARGET_PER_DEVICE_ROOTFS; do
+            grep -q "^${opt}=y" .config && echo "OK: $opt" || echo "MISSING: $opt"
+          done
+
+          echo "=== check critical packages ==="
+          for pkg in kmod-mt_wifi kmod-conninfra kmod-warp kmod-mediatek_hnat wifi-dats mtwifi-cfg-ucode luci-app-mtwifi-cfg kmod-zram kmod-lib-lz4 kmod-usb3 automount; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
+          done
+
+          echo "=== check kmod-as-module (=m) ==="
+          for pkg in kmod-nft-tproxy kmod-tun kmod-nft-socket kmod-inet-diag kmod-netlink-diag kmod-nft-fullcone; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=m" .config && echo "OK: $pkg=m" || echo "MISSING: $pkg=m"
+          done
+
+          echo "=== check AmneziaWG ==="
+          for pkg in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
+          done
+          grep -q "^CONFIG_PACKAGE_kmod-wireguard=y" .config && echo "WARN: kmod-wireguard всё ещё включён" || echo "OK: kmod-wireguard отключён"
+
+      - name: Download Packages
+        run: |
+          cd openwrt
+          make download -j8
+
+      - name: Compile AmneziaWG Only
+        if: ${{ inputs.build_amneziawg_only }}
+        run: |
+          cd openwrt
+          rm -rf tmp
+          echo "=== Building AmneziaWG packages only (YAAWG / awgopenwrt feed) ==="
+          echo "NOTE: kmod-amneziawg needs kernel headers — fresh runner will need toolchain+headers prepared"
+
+          build_awg() {
+            make package/feeds/awgopenwrt/kmod-amneziawg/compile V=s \
+              && make package/feeds/awgopenwrt/amneziawg-tools/compile V=s \
+              && make package/feeds/awgopenwrt/luci-proto-amneziawg/compile V=s
+          }
+
+          if build_awg; then
+            echo "=== Attempt 1 OK: direct compile succeeded (warm cache) ==="
+          else
+            echo "=== Attempt 1 failed → preparing toolchain + kernel headers only ==="
+            if make tools/install toolchain/install target/linux/compile -j$(nproc) V=s && build_awg; then
+              echo "=== Attempt 2 OK: compile succeeded after toolchain+headers prepare ==="
+            else
+              echo "=== Attempt 2 failed → full build (slow, ~1.5h) ==="
+              make -j$(nproc) || make -j1 V=s || true
+              build_awg
+            fi
+          fi
+
+          echo "=== AmneziaWG packages built ==="
+          find bin/packages -name "*amnezia*" -o -name "*awg*" | sort
+
+          if ! find bin/packages -name "*kmod-amneziawg*.apk" | grep -q .; then
+            echo "ERROR: kmod-amneziawg package not found"
+            exit 1
+          fi
+
+      - name: Compile Firmware
+        if: ${{ !inputs.build_amneziawg_only }}
+        run: |
+          cd openwrt
+          rm -rf tmp
+          make -j$(nproc) || make -j1 V=s
+          echo "=== check result ==="
+          ls -lh bin/targets/mediatek/filogic/*nx32u* bin/targets/mediatek/filogic/*routerich* 2>/dev/null || {
+            echo "ERROR: no images found"
+            exit 1
+          }
+
+      - name: Validate firmware (sanity check, non-blocking)
+        if: success() && !inputs.build_amneziawg_only
+        continue-on-error: true
+        run: |
+          cd openwrt
+          echo "=== Image sizes ==="
+          for img in bin/targets/mediatek/filogic/*.bin bin/targets/mediatek/filogic/*.itb bin/targets/mediatek/filogic/*.ubi; do
+            [ -f "$img" ] || continue
+            SIZE=$(stat -c%s "$img")
+            SIZE_MB=$((SIZE/1024/1024))
+            echo "$(basename $img): ${SIZE_MB} MB"
+            if [ "$SIZE" -lt 5000000 ]; then
+              echo "WARN: $img is suspiciously small (${SIZE} bytes)"
+            fi
+          done
+
+          echo "=== Check amneziawg.ko in rootfs ==="
+          if command -v unsquashfs >/dev/null 2>&1; then
+            for img in bin/targets/mediatek/filogic/*squashfs-sysupgrade.bin; do
+              [ -f "$img" ] || continue
+              if unsquashfs -l "$img" 2>/dev/null | grep -q 'amneziawg.ko'; then
+                echo "OK: amneziawg.ko present in $(basename $img)"
+              else
+                echo "WARN: amneziawg.ko NOT found in $(basename $img)"
+              fi
+            done
+          else
+            echo "SKIP: unsquashfs not installed on runner"
+          fi
+
+      - name: Record build-info.txt (vermagic)
+        if: success()
+        run: |
+          cd openwrt
+          KVER=$(cat build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic/linux-*/include/config/kernel.release 2>/dev/null | head -1 || echo "unknown")
+          VMOD=$(find build_dir/target-aarch64_cortex-a53_musl/linux-mediatek_filogic -name 'amneziawg.ko' 2>/dev/null | head -1)
+          if [ -n "$VMOD" ]; then
+            VERMAGIC=$(strings "$VMOD" | grep -m1 '^vermagic=' | sed 's/^vermagic=//' || echo "unknown")
+          else
+            VERMAGIC="kmod not built (AmneziaWG only mode or build failed)"
+          fi
+          cat > build-info.txt <<EOF
+          YAAWG build info
+          =================
+          Base:      ${{ inputs.base_repo }}
+          Branch:    ${{ env.BRANCH }}
+          Commit:    $(git log -1 --format=%H 2>/dev/null || echo "unknown")
+          Kernel:    ${KVER}
+          Vermagic:  ${VERMAGIC}
+          Built at:  $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Mode:      ${{ inputs.build_amneziawg_only && 'AmneziaWG packages only' || 'Full firmware' }}
+
+          EOF
+
+          cat >> build-info.txt <<'EOF'
+          Post-flash notes
+          ================
+          1. Homeproxy (luci-app-re-homeproxy) НЕ в образе — ставится вручную:
+               wget -qO- https://raw.githubusercontent.com/ezdizzy/re-homeproxy/master/install.sh | sh
+
+          2. sing-box-extended-lite НЕ в образе — ставится отдельно:
+               sh <(wget -qO- https://raw.githubusercontent.com/MANCrimSon/sing-box-extended-lite/main/install.sh)
+
+          3. После первого запуска homeproxy проверить:
+               uci get homeproxy.config.preferred_core    # должен быть 'singbox'
+               /usr/bin/sing-box version                  # extended-lite
+
+          4. Для AWG на lite-сборке (kernel WG быстрее gvisor):
+               uci set 'homeproxy.@node[N].wireguard_backend=system'
+               uci commit homeproxy && /etc/init.d/homeproxy restart
+          EOF
+
+          echo "=== build-info.txt ==="
+          cat build-info.txt
+          cp build-info.txt bin/ 2>/dev/null || true
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save build_dir
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/build_dir
+          key: build-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save staging_dir
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/staging_dir
+          key: staging-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save dl-cache
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: ${{ runner.workspace }}/dl-cache
+          key: dl-${{ inputs.base_repo }}-${{ steps.clone.outputs.openwrt_rev || github.sha }}
+
+      - name: Upload AmneziaWG Packages
+        if: success() && inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-packages
+          path: |
+            openwrt/bin/packages/**/*amnezia*.apk
+            openwrt/bin/packages/**/*awg*.apk
+            openwrt/build-info.txt
+          if-no-files-found: error
+
+      - name: Upload Packages (common, all devices)
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-all
+          path: openwrt/bin/packages/
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Netis NX32U
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-netis-nx32u
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*nx32u*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Routerich AX3000-V1
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-routerich-ax3000-v1
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-v1*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Routerich AX3000
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-routerich-ax3000
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-squashfs*
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-initramfs*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Build Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-failure
+          path: |
+            openwrt/logs/
+            openwrt/tmp/
+            openwrt/.config
+            openwrt/bin/
+          if-no-files-found: ignore
