@@ -1,0 +1,82 @@
+name: Sync with chasey-dev upstream (force, explicit preserve)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Force-sync with explicit file preservation
+        run: |
+          set -euo pipefail
+          PRESERVE=/tmp/preserve
+          mkdir -p "$PRESERVE"
+
+          # ─── ЯВНЫЙ СПИСОК ФАЙЛОВ, КОТОРЫЕ СОХРАНЯЕМ ───
+          FILES_TO_PRESERVE="
+          config/nx32u.config
+          apply-usb3-fixes.sh
+          .github/workflows/build.yml
+          .github/workflows/sync-upstream.yml
+          "
+
+          echo "=== Файлы, которые будут сохранены ==="
+          for f in $FILES_TO_PRESERVE; do
+            if [ -f "$f" ]; then
+              mkdir -p "$PRESERVE/$(dirname "$f")"
+              cp "$f" "$PRESERVE/$f"
+              echo "  OK: $f ($(wc -c < "$f") bytes)"
+            else
+              echo "  WARN: $f not found (skipped)"
+            fi
+          done
+
+          # ─── Тянем upstream ───
+          git remote add upstream https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git
+          git fetch upstream 25.12
+
+          if git merge-base --is-ancestor upstream/25.12 HEAD; then
+            echo "Already up to date with upstream (but restoring preserved files anyway)"
+          fi
+
+          # ─── Сброс на upstream ───
+          git reset --hard upstream/25.12
+
+          # ─── Возвращаем сохранённые файлы ───
+          echo "=== Восстанавливаем сохранённые файлы ==="
+          for f in $FILES_TO_PRESERVE; do
+            if [ -f "$PRESERVE/$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              cp "$PRESERVE/$f" "$f"
+              echo "  RESTORED: $f"
+            fi
+          done
+
+          # ─── Коммит ───
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit after preserving."
+            exit 0
+          fi
+
+          git commit -m "sync: reset to chasey-dev/25.12 + preserve config/nx32u.config, apply-usb3-fixes.sh, .github/workflows/*.yml"
+
+          # ─── Force-push ───
+          git push origin HEAD:main --force-with-lease
